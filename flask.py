@@ -12,6 +12,7 @@
 from __future__ import with_statement
 import os
 import sys
+from itertools import chain
 
 from jinja2 import Environment, PackageLoader, FileSystemLoader
 from werkzeug import Request as RequestBase, Response as ResponseBase, \
@@ -47,6 +48,33 @@ except (ImportError, AttributeError):
     pkg_resources = None
 
 
+class Module(object):
+    def __init__(self, name, url_prefix):
+        self.name = name
+        if url_prefix is None:
+          self.url_prefix = '/%s' % name
+        else:
+          self.url_prefix = url_prefix
+          
+
+    def route(self, rule, **options):
+        def decorator(f):
+            rule_combined = self.url_prefix + rule
+            endpoint = '%s.%s' % (self.name, f.__name__)
+            self.app.add_url_rule(rule_combined, endpoint, f, **options)
+            return f
+        return decorator
+
+    def before_request(self, f):
+        """Registers a function to run before each request."""
+        self.app.before_request_funcs.setdefault(self.name, []).append(f)
+        return f
+
+    def after_request(self, f):
+        """Register a function to be run after each request."""
+        self.app.after_request_funcs.setdefault(self.name, []).append(f)
+        return f
+
 class Request(RequestBase):
     """The request object used by default in flask.  Remembers the
     matched endpoint and view arguments.
@@ -58,6 +86,12 @@ class Request(RequestBase):
 
     endpoint = view_args = None
 
+    @property
+    def module(self):
+        """The name of the current module"""
+        if self.endpoint and '.' in self.endpoint:
+            return self.endpoint.rsplit('.', 1)[0]
+          
     @cached_property
     def json(self):
         """If the mimetype is `application/json` this will contain the
@@ -116,6 +150,12 @@ class _RequestContext(object):
             self.session = _NullSession()
         self.g = _RequestGlobals()
         self.flashes = None
+        
+        try:
+            self.request.endpoint, self.request.view_args = \
+                self.url_adapter.match()
+        except HTTPException, e:
+            self.request.routing_exception = e
 
     def __enter__(self):
         _request_ctx_stack.push(self)
@@ -356,14 +396,14 @@ class Flask(object):
         #: getting hold of the currently logged in user.
         #: To register a function here, use the :meth:`before_request`
         #: decorator.
-        self.before_request_funcs = []
+        self.before_request_funcs = {}
 
         #: a list of functions that are called at the end of the
         #: request.  The function is passed the current response
         #: object and modify it in place or replace it.
         #: To register a function here use the :meth:`after_request`
         #: decorator.
-        self.after_request_funcs = []
+        self.after_request_funcs = {}
 
         #: a list of functions that are called without arguments
         #: to populate the template context.  Each returns a dictionary
@@ -388,6 +428,8 @@ class Flask(object):
         #:    app = Flask(__name__)
         #:    app.url_map.converters['list'] = ListConverter
         self.url_map = Map()
+
+        self.modules = []
 
         if self.static_path is not None:
             self.add_url_rule(self.static_path + '/<filename>',
@@ -641,12 +683,12 @@ class Flask(object):
 
     def before_request(self, f):
         """Registers a function to run before each request."""
-        self.before_request_funcs.append(f)
+        self.before_request_funcs.setdefault(None, []).append(f)
         return f
 
     def after_request(self, f):
         """Register a function to be run after each request."""
-        self.after_request_funcs.append(f)
+        self.after_request_funcs.setdefault(None, []).append(f)
         return f
 
     def context_processor(self, f):
@@ -723,7 +765,11 @@ class Flask(object):
         if it was the return value from the view and further
         request handling is stopped.
         """
-        for func in self.before_request_funcs:
+        funcs = self.before_request_funcs.get(None, ())
+        mod = request.module
+        if mod and mod in self.before_request_funcs:
+            funcs = chain(funcs, self.before_request_funcs[mod])
+        for func in funcs:
             rv = func()
             if rv is not None:
                 return rv
@@ -737,10 +783,16 @@ class Flask(object):
         :return: a new response object or the same, has to be an
                  instance of :attr:`response_class`.
         """
-        session = _request_ctx_stack.top.session
-        if not isinstance(session, _NullSession):
-            self.save_session(session, response)
-        for handler in self.after_request_funcs:
+        ctx = _request_ctx_stack.top
+        mod = ctx.request.module
+        if not isinstance(ctx.session, _NullSession):
+            self.save_session(ctx.session, response)
+        funcs = ()
+        if mod and mod in self.after_request_funcs:
+            funcs = chain(funcs, self.after_request_funcs[mod])
+        if None in self.after_request_funcs:
+            funcs = chain(funcs, self.after_request_funcs[None])
+        for handler in funcs:
             response = handler(response)
         return response
 
@@ -797,6 +849,11 @@ class Flask(object):
         """Shortcut for :attr:`wsgi_app`."""
         return self.wsgi_app(environ, start_response)
 
+    def register_module(self, name, url_prefix=None):
+        module = Module(name, url_prefix)
+        module.app = self
+        self.modules.append(module)
+        return module
 
 # context locals
 _request_ctx_stack = LocalStack()
